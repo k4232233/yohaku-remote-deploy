@@ -1,10 +1,6 @@
-name: Build and Deploy
+name: Build and Deploy (remix)
 
 on:
-  push:
-    branches:
-      - main
-
   workflow_dispatch:
     inputs:
       force_build:
@@ -14,26 +10,28 @@ on:
         type: boolean
 
   repository_dispatch:
-    types: [trigger-workflow]
+    types: [trigger-remix]
 
 permissions:
   contents: write
   packages: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-remix
   cancel-in-progress: true
 
 env:
-  HASH_FILE: build_hash
+  HASH_FILE: build_hash.remix
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/yohaku
+  SOURCE_REF: refactor/remix
+  ROUTE: remix
 
 jobs:
   prepare:
     name: Prepare
     runs-on: ubuntu-latest
-    if: ${{ !startsWith(github.event.head_commit.message, 'chore(hash):') }}
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(hash-') }}
 
     outputs:
       hash_content: ${{ steps.read_hash.outputs.hash_content }}
@@ -62,6 +60,7 @@ jobs:
         with:
           repository: innei-dev/yohaku
           token: ${{ secrets.GH_PAT }}
+          ref: ${{ env.SOURCE_REF }}
           fetch-depth: 0
           lfs: true
           submodules: recursive
@@ -141,8 +140,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
-            type=raw,value=${{ needs.check.outputs.sha_short }}
+            type=raw,value=remix
+            type=raw,value=remix-${{ needs.check.outputs.sha_short }}
 
       - name: Build and Push
         uses: docker/build-push-action@v7
@@ -154,8 +153,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BASE_URL=${{ secrets.BASE_URL }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=remix
+          cache-to: type=gha,mode=max,scope=remix
 
   deploy:
     name: Deploy via Dokploy
@@ -170,7 +169,7 @@ jobs:
             -H "accept: application/json" \
             -H "Content-Type: application/json" \
             -H "x-api-key: ${{ secrets.DOKPLOY_API_TOKEN }}" \
-            -d '{"applicationId": "${{ secrets.DOKPLOY_APP_ID }}"}')
+            -d '{"applicationId": "${{ secrets.DOKPLOY_APP_ID_REMIX }}"}')
 
           http_code=$(echo "$response" | tail -n1)
           body=$(echo "$response" | sed '$d')
@@ -202,6 +201,8 @@ jobs:
           SHA_SHORT: ${{ needs.build.outputs.sha_short }}
           SHA_FULL: ${{ needs.build.outputs.sha_full }}
           APP_REPO_SLUG: innei-dev/yohaku
+          ROUTE: ${{ env.ROUTE }}
+          SOURCE_REF: ${{ env.SOURCE_REF }}
           FORCE_BUILD: ${{ github.event.inputs.force_build || '' }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           GITHUB_ACTOR: ${{ github.actor }}
@@ -217,11 +218,11 @@ jobs:
           fi
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           COMMIT_URL="https://github.com/${APP_REPO_SLUG}/commit/${SHA_FULL}"
-          IMAGE_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/yohaku:latest"
-          IMAGE_SHA="ghcr.io/${GITHUB_REPOSITORY_OWNER}/yohaku:${SHA_SHORT}"
+          IMAGE_ROLLING="ghcr.io/${GITHUB_REPOSITORY_OWNER}/yohaku:${ROUTE}"
+          IMAGE_SHA="ghcr.io/${GITHUB_REPOSITORY_OWNER}/yohaku:${ROUTE}-${SHA_SHORT}"
           GH_PKGS_URL="https://github.com/${GITHUB_REPOSITORY_OWNER}?tab=packages"
           COMPLETED_AT="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          export RUN_URL COMMIT_URL IMAGE_LATEST IMAGE_SHA GH_PKGS_URL COMPLETED_AT
+          export RUN_URL COMMIT_URL IMAGE_ROLLING IMAGE_SHA GH_PKGS_URL COMPLETED_AT
 
           MSG="$(python3 <<'PY'
           import html
@@ -243,11 +244,13 @@ jobs:
           commit_url_href = os.environ["COMMIT_URL"]
           gh_pkgs_href = os.environ["GH_PKGS_URL"]
           owner_disp = esc(os.environ["GITHUB_REPOSITORY_OWNER"])
-          image_latest = esc(os.environ["IMAGE_LATEST"])
+          image_rolling = esc(os.environ["IMAGE_ROLLING"])
           image_sha = esc(os.environ["IMAGE_SHA"])
           completed = esc(os.environ["COMPLETED_AT"])
           sha_ci = esc(os.environ["GITHUB_SHA"][:40])
           app_slug = esc(os.environ["APP_REPO_SLUG"])
+          route = esc(os.environ["ROUTE"])
+          source_ref = esc(os.environ["SOURCE_REF"])
 
           force = (os.environ.get("FORCE_BUILD") or "").strip().lower()
 
@@ -260,7 +263,8 @@ jobs:
                   one_line += "…"
               head_preview = f"<b>编排仓库 HEAD 说明</b>\n{esc(one_line)}"
 
-          parts: list[str] = ["<b>🚀 yohaku 部署成功</b>"]
+          parts: list[str] = [f"<b>🚀 yohaku 部署成功 [{route}]</b>"]
+          parts.append(f"<b>源分支</b>: <code>{source_ref}</code>")
           if force == "true":
               parts.append("⚙️ <b>强制重建</b>: 是")
 
@@ -268,7 +272,7 @@ jobs:
               [
                   "",
                   "<b>📦 镜像 (GHCR)</b>",
-                  f"• <code>{image_latest}</code>",
+                  f"• <code>{image_rolling}</code>",
                   f"• <code>{image_sha}</code>",
                   f'<a href="{gh_pkgs_href}">Packages（{owner_disp}）</a>',
                   "",
@@ -332,7 +336,7 @@ jobs:
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add ${{ env.HASH_FILE }}
-          git commit -m "chore(hash): update to $SHA_SHORT"
+          git commit -m "chore(hash-remix): update to $SHA_SHORT"
 
       - name: Push changes
         uses: ad-m/github-push-action@master
@@ -359,6 +363,8 @@ jobs:
           SHA_SHORT: ${{ needs.check.outputs.sha_short || '' }}
           SHA_FULL: ${{ needs.check.outputs.sha_full || '' }}
           APP_REPO_SLUG: innei-dev/yohaku
+          ROUTE: ${{ env.ROUTE }}
+          SOURCE_REF: ${{ env.SOURCE_REF }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
@@ -416,6 +422,8 @@ jobs:
           run_url = os.environ["RUN_URL"]
           completed = esc(os.environ["COMPLETED_AT"])
           sha_ci = esc(os.environ["GITHUB_SHA"][:40])
+          route = esc(os.environ["ROUTE"])
+          source_ref = esc(os.environ["SOURCE_REF"])
 
           head_msg = (os.environ.get("COMMIT_MSG_HEAD") or "").strip()
           head_preview = ""
@@ -427,7 +435,8 @@ jobs:
               head_preview = f"<b>编排仓库 HEAD 说明</b>\n{esc(one_line)}"
 
           parts: list[str] = [
-              "<b>❌ yohaku 部署 / CI 失败</b>",
+              f"<b>❌ yohaku 部署 / CI 失败 [{route}]</b>",
+              f"<b>源分支</b>: <code>{source_ref}</code>",
               f"<b>失败的 job</b>: <code>{failed_line}</code>",
               "",
               "<b>📎 应用源码（若已解析到提交）</b>",

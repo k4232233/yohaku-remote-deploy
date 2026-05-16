@@ -1,124 +1,132 @@
-# Shiroi Dokploy Deploy
+# Yohaku Remote Deploy
 
-使用 GitHub Actions 构建 Shiroi Docker 镜像并通过 Dokploy 部署。
+通过 GitHub Actions 构建 Yohaku Docker 镜像，推送到 GitHub Container Registry (GHCR)，并调用 Dokploy API 触发部署。
 
-## 为什么？
+## 路线（routes）
 
-Shiroi 是 [Shiro](https://github.com/Innei/Shiro) 的闭源开发版本。
+两套并行：
 
-由于 Next.js 构建需要大量内存，很多服务器无法承受这样的开销。此项目利用 GitHub Actions 构建 Docker 镜像，推送到 GitHub Container Registry (GHCR) 私有仓库，然后通过 Dokploy API 触发部署。
+| route | 源分支 | rolling tags | immutable tag | dokploy app secret |
+|-------|--------|--------------|---------------|--------------------|
+| `main`  | `main` (Next.js, 未来合 remix 后变 RR7) | `latest`, `main`, `nextjs` | `main-<sha>` | `DOKPLOY_APP_ID_MAIN` |
+| `remix` | `refactor/remix` (React Router 7)        | `remix`                    | `remix-<sha>` | `DOKPLOY_APP_ID_REMIX` |
 
-## 工作流程
+`:latest` 永远跟 main，合并完成自然指向 RR7；`:nextjs` 是 Next.js 阶段之别名，merge 之日删除 `deploy-main.yml` 中此 tag，最后一份 build 即自动锁定为 Next.js archive。
+
+## 工作流
 
 ```
-Shiroi 仓库 push
+yohaku 仓 push (main / refactor/remix)
        ↓
-GitHub Actions 构建镜像
+yohaku 仓 notify-remote-deploy.yml 调 repository_dispatch
        ↓
-推送到 GHCR (私有)
+yohaku-remote-deploy 编排仓 deploy-<route>.yml
        ↓
-调用 Dokploy API 触发部署
+检查 build_hash.<route> 去重 → 构建 Dockerfile → 推 GHCR
        ↓
-Dokploy 从 GHCR 拉取镜像并部署
+调 Dokploy API 触发 redeploy
+       ↓
+Dokploy 拉新 image，部署
 ```
 
-## 配置步骤
+## 文件
 
-### 1. Dokploy 配置
+```
+.github/workflows/
+  deploy-main.yml      # main route
+  deploy-remix.yml     # remix route
+build_hash.main        # main route 去重指针（CI 自动维护）
+build_hash.remix       # remix route 去重指针（CI 自动维护）
+```
 
-#### 添加 GHCR Registry
+## Dokploy 配置
 
-在 Dokploy Dashboard → Settings → Registry → Add Registry：
+### Registry credential
+
+`Dashboard → Settings → Registry → Add Registry`：
 
 | 字段 | 值 |
 |------|-----|
 | Name | `ghcr` |
 | Registry URL | `ghcr.io` |
-| Username | 你的 GitHub 用户名 |
-| Password | GitHub PAT (需要 `read:packages` 权限) |
+| Username | GitHub 用户名 |
+| Password | GitHub PAT (`read:packages`) |
 
-#### 创建 Application
+### Application（main）
 
-1. 创建新的 Application，选择 **Docker** 类型
-2. 配置镜像：
-   - Registry: 选择刚才添加的 `ghcr`
-   - Image: `ghcr.io/<your-username>/shiroi`
-   - Tag: `latest`
-3. 配置环境变量（参考 Shiroi 文档）
-4. 配置端口映射、数据卷等
+- buildType: `dockerImage`
+- dockerImage: `ghcr.io/innei/yohaku:latest`
+- registry: `ghcr`
 
-#### 获取 Application ID
+### Application（remix）
 
-从 Dokploy URL 中提取，例如：
-```
-https://dokploy.example.com/dashboard/project/.../services/application/hdoihUG0FmYC8GdoFEc
-                                                                      └─────────────────┘
-                                                                        这就是 App ID
-```
+- buildType: `dockerImage`（务必从 `dockerfile` 切到 `dockerImage`）
+- sourceType: `docker`（务必从 `github` 切到 `docker`，避免 dokploy 端再 build）
+- dockerImage: `ghcr.io/innei/yohaku:remix`
+- registry: `ghcr`
 
-#### 生成 API Token
+> autoDeploy 可关可不关。GitHub Actions 完成后会显式 curl `application.deploy` 触发 redeploy。
 
-Dokploy Dashboard → Profile → Generate API Key
+## 触发方式
 
-### 2. GitHub Secrets 配置
+| 来源 | 触发哪个 workflow |
+|------|------------------|
+| yohaku 仓 push main           | `repository_dispatch` `trigger-main` → `deploy-main.yml` |
+| yohaku 仓 push refactor/remix | `repository_dispatch` `trigger-remix` → `deploy-remix.yml` |
+| 手动                          | `workflow_dispatch`（支持 `force_build`） |
 
-在此仓库的 Settings → Secrets and variables → Actions 中添加：
+编排仓自身 push **不再**触发任何 build（避免改 workflow 时误触发部署）。
+
+## GitHub Secrets（yohaku-remote-deploy 仓）
 
 | Secret | 说明 |
 |--------|------|
-| `GH_PAT` | 可访问 Shiroi 私有仓库的 GitHub Token (需要 `repo` 权限) |
-| `DOKPLOY_URL` | Dokploy 实例地址，如 `https://dokploy.example.com` (不带尾部斜杠) |
-| `DOKPLOY_API_TOKEN` | Dokploy 生成的 API Key |
-| `DOKPLOY_APP_ID` | Dokploy Application ID |
-| `AFTER_DEPLOY_SCRIPT` | (可选) 部署后执行的脚本 |
-| `BASE_URL` | Docker **build-arg**，站点根 URL（建议无尾部斜杠）；与私有 `Dockerfile` 中 `ARG BASE_URL` 一致 |
+| `GH_PAT` | 可访问 `innei-dev/yohaku` 私有仓的 PAT（`repo` scope） |
+| `DOKPLOY_URL` | Dokploy 实例地址（不带尾部斜杠） |
+| `DOKPLOY_API_TOKEN` | Dokploy API Key |
+| `DOKPLOY_APP_ID_MAIN`  | main route 的 Dokploy Application ID |
+| `DOKPLOY_APP_ID_REMIX` | remix route 的 Dokploy Application ID |
+| `BASE_URL` | Docker build-arg，站点根 URL（无尾部斜杠） |
+| `TELEGRAM_BOT_TOKEN` | （可选）Telegram 通知用 bot token |
+| `AFTER_DEPLOY_SCRIPT` | （可选）部署后执行的 shell 脚本 |
 
-#### `BASE_URL`、ISR 与 `NEXT_PUBLIC_*`
+## yohaku 仓 notify 配置
 
-当前 Shiroi `Dockerfile` 典型写法为：`ARG BASE_URL`，并在 builder 阶段令 `NEXT_PUBLIC_GATEWAY_URL=${BASE_URL}`、`NEXT_PUBLIC_API_URL=${BASE_URL}/api/v2`。CI 只需传入 **`BASE_URL`** 作为 build-arg，`next build` 即可得到一致的公开端点。
+`innei-dev/yohaku` 仓内 `.github/workflows/notify-remote-deploy.yml`，监听 `push: branches: [main, refactor/remix]`，按分支名调对应 `repository_dispatch` event。需要在 yohaku 仓配置：
 
-若站点启用 **ISR**，构建期仍会按上述 URL 访问后端；仅依赖运行时的容器环境变量无法覆盖已写入 bundle 的构建期取值，因此 **`BASE_URL` 必须在镜像构建时传入**，并与 Dokploy 中运行时配置的站点根 URL 一致。
+| Secret | 说明 |
+|--------|------|
+| `YOHAKU_REMOTE_DEPLOY_PAT` | 可对 `Innei/yohaku-remote-deploy` 执行 `repository_dispatch` 的 PAT（`repo` scope） |
 
-构建期密钥类变量（如 `S3_*`、`TMDB_API_KEY`、`GH_TOKEN`、`WEBHOOK_SECRET`）在 `Dockerfile` 中多为独立 `ARG`，若构建命令需要它们，请在 **同一 `build-args` 块**中增加对应 Secrets（勿写入仓库明文）。
+## 强制重建
 
-### 3. 创建 GitHub PAT
-
-1. 进入 [GitHub Settings → Tokens](https://github.com/settings/tokens)
-2. Generate new token (classic)
-3. 选择权限：
-   - `repo` - 访问私有仓库
-   - `read:packages` - 读取 packages (Dokploy 拉取镜像用)
-   - `write:packages` - 写入 packages (CI 推送镜像用，会自动获得)
-
-## 触发部署
-
-- **自动触发**：Push 到 `main` 分支
-- **手动触发**：使用 `repository_dispatch` 事件
-
-## 镜像管理
-
-镜像存储在 GHCR 私有仓库：`ghcr.io/<username>/shiroi`
-
-每次构建会生成两个 tag：
-- `latest` - 最新版本
-- `<commit-sha>` - 对应的 commit hash
+在编排仓的 Actions 页面手动跑 workflow，勾 `force_build: true`，忽略 `build_hash.<route>` 比较直接 rebuild。
 
 ## 故障排除
 
-### 镜像推送失败
+### Build 阶段：镜像推送失败
 
-1. 检查 `GITHUB_TOKEN` 权限是否包含 `packages:write`
-2. 确认仓库 Settings → Actions → General → Workflow permissions 设置为 "Read and write permissions"
+1. `GITHUB_TOKEN` 需要 `packages: write`（workflow 已声明）
+2. 仓库 Settings → Actions → General → Workflow permissions = `Read and write`
+3. 仓库 Settings → Actions → General → Allow GitHub Actions to create and approve pull requests（store job push hash 用）
 
-### Dokploy 部署失败
+### Deploy 阶段：Dokploy 调用失败
 
-1. 检查 `DOKPLOY_URL` 是否正确（不带尾部斜杠）
-2. 确认 `DOKPLOY_API_TOKEN` 有效
-3. 确认 `DOKPLOY_APP_ID` 正确
-4. 检查 Dokploy 中的 Registry 凭证是否正确
+1. `DOKPLOY_URL` 不带尾部斜杠
+2. `DOKPLOY_API_TOKEN` 在 Dokploy `Profile → Generate API Key`
+3. `DOKPLOY_APP_ID_*` 取自 Application URL 末段
 
-### Dokploy 拉取镜像失败
+### Dokploy 拉取 image 失败
 
-1. 确认 Dokploy 中配置的 Registry 凭证正确
-2. 确认 PAT 有 `read:packages` 权限
-3. 检查镜像地址是否正确：`ghcr.io/<username>/shiroi:latest`
+1. Settings → Registry 已配 `ghcr` 凭证，PAT 含 `read:packages`
+2. Application 配的 `dockerImage` 路径正确（注意 GHCR owner 大小写）
+3. GHCR package 已公开，或 dokploy 凭证有访问权
+
+## 切到 RR7 (main) 后的清理
+
+当 `refactor/remix` 合并进 `main` 后：
+
+1. 删 `deploy-remix.yml`、`build_hash.remix`
+2. 删 `deploy-main.yml` 中 `:nextjs` tag（保留 `:latest` `:main` `:main-<sha>`）
+3. Dokploy 删 remix application，main application `dockerImage` 不需要改
+4. yohaku 仓 `notify-remote-deploy.yml` 去掉 `refactor/remix` 分支
