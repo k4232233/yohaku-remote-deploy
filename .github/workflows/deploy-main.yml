@@ -1,6 +1,7 @@
 name: Build and Deploy (main)
 
 on:
+  # 1. 网页手动触发
   workflow_dispatch:
     inputs:
       force_build:
@@ -9,13 +10,16 @@ on:
         default: 'false'
         type: boolean
 
+  # 2. 外部 API 触发(代码仓库中 .github/workflows/notify-remote-deploy.yml)
   repository_dispatch:
     types: [trigger-main]
 
+# 3. 写入权限，更新 hash
 permissions:
   contents: write
   packages: write
 
+# 并发控制(最新优先,单实例覆盖)  
 concurrency:
   group: ${{ github.workflow }}-main
   cancel-in-progress: true
